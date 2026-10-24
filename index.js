@@ -1,30 +1,11 @@
 const mineflayer = require('mineflayer');
 const express = require('express');
 
-// Gói "socks" chỉ cần khi dùng proxy. Chưa cài thì bot vẫn chạy bình thường (kết nối thẳng).
-let SocksClient = null;
-try { SocksClient = require('socks').SocksClient; } catch (e) {}
-
 const app = express();
 const port = process.env.PORT || 10000;
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-
-// BẢO VỆ DASHBOARD (TÙY CHỌN): đặt biến môi trường DASH_USER / DASH_PASS trên Render để bật.
-// /api/ping luôn mở để UptimeRobot kích bot.
-const DASH_USER = process.env.DASH_USER || 'admin';
-const DASH_PASS = process.env.DASH_PASS || '';
-app.use((req, res, next) => {
-  if (!DASH_PASS || req.path === '/api/ping') return next();
-  const [scheme, encoded] = (req.headers.authorization || '').split(' ');
-  if (scheme === 'Basic' && encoded) {
-    const decoded = Buffer.from(encoded, 'base64').toString();
-    const idx = decoded.indexOf(':');
-    if (decoded.slice(0, idx) === DASH_USER && decoded.slice(idx + 1) === DASH_PASS) return next();
-  }
-  res.set('WWW-Authenticate', 'Basic realm="Bot Dashboard"').status(401).send('Cần đăng nhập');
-});
 
 // ÉP MÚI GIỜ VIỆT NAM TOÀN HỆ THỐNG
 process.env.TZ = 'Asia/Ho_Chi_Minh';
@@ -65,107 +46,6 @@ let isManualStopped = false; // BẬT/TẮT BOT THỦ CÔNG
 let isFirstSpawn = true;
 
 let currentReconnectDelay = 12000;
-
-// --- ĐỔI IP QUA PROXY SOCKS5 (TUỲ CHỌN) ---
-// Đặt biến môi trường PROXIES trên Render, cách nhau bằng dấu phẩy:
-//   socks5://user:pass@1.2.3.4:1080,socks5://5.6.7.8:1080
-// Thứ tự xoay: kết nối thẳng (IP Render) -> proxy 1 -> proxy 2 -> ... -> quay lại kết nối thẳng
-const PROXY_STATIC = (process.env.PROXIES || '').split(',').map(s => s.trim()).filter(Boolean);
-let PROXY_LIST = [...PROXY_STATIC];
-
-// TỰ ĐỘNG TÌM PROXY (THỬ NGHIỆM): đặt PROXY_LIST_URL = link file .txt, mỗi dòng 1 proxy dạng ip:port
-// hoặc socks5://user:pass@ip:port. Bot tự tải, thử kết nối tới server Minecraft và giữ lại proxy chạy được.
-const PROXY_LIST_URL = process.env.PROXY_LIST_URL || '';
-let proxyRefreshing = false;
-let needRotate = false;   // đang cần đổi IP nhưng chưa có proxy nào
-let sameIpKicks = 0;      // số lần liên tiếp bị kick vì trùng IP
-let proxyIndex = -1; // -1 = kết nối thẳng
-
-function parseProxy(str) {
-  try {
-    const u = new URL(str);
-    return {
-      host: u.hostname,
-      port: parseInt(u.port) || 1080,
-      type: 5,
-      userId: u.username ? decodeURIComponent(u.username) : undefined,
-      password: u.password ? decodeURIComponent(u.password) : undefined
-    };
-  } catch (e) {
-    return null;
-  }
-}
-
-function getCurrentProxy() {
-  if (!SocksClient || proxyIndex < 0 || proxyIndex >= PROXY_LIST.length) return null;
-  return parseProxy(PROXY_LIST[proxyIndex]);
-}
-
-function getProxyLabel() {
-  if (!SocksClient) return 'Trực tiếp (thiếu gói socks)';
-  const p = getCurrentProxy();
-  if (p) return `Proxy ${proxyIndex + 1}/${PROXY_LIST.length} (${p.host})`;
-  if (PROXY_LIST.length === 0) return PROXY_LIST_URL ? 'Trực tiếp (đang tìm proxy...)' : 'Trực tiếp (chưa có PROXIES)';
-  return `Trực tiếp (IP Render) · ${PROXY_LIST.length} proxy sẵn sàng`;
-}
-
-// Thử 1 proxy: có nối được tới server Minecraft hay không
-async function testProxy(str) {
-  const p = parseProxy(str);
-  if (!p || !SocksClient) return false;
-  try {
-    const info = await SocksClient.createConnection({
-      proxy: p,
-      command: 'connect',
-      destination: { host: BOT_HOST, port: BOT_PORT },
-      timeout: 6000
-    });
-    info.socket.destroy();
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-async function refreshProxyList() {
-  if (!PROXY_LIST_URL || !SocksClient || proxyRefreshing) return;
-  proxyRefreshing = true;
-  try {
-    const res = await fetch(PROXY_LIST_URL, { signal: AbortSignal.timeout(15000) });
-    const text = await res.text();
-    const candidates = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-      .map(s => (/^socks5:\/\//i.test(s) ? s : `socks5://${s}`))
-      .filter(s => parseProxy(s));
-
-    // Trộn ngẫu nhiên rồi thử tối đa 60 proxy, giữ tối đa 8 cái chạy được
-    for (let i = candidates.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
-    }
-    const batch = candidates.slice(0, 60);
-    const good = [];
-    for (let i = 0; i < batch.length && good.length < 8; i += 15) {
-      const chunk = batch.slice(i, i + 15);
-      const results = await Promise.all(chunk.map(testProxy));
-      chunk.forEach((p, k) => { if (results[k] && good.length < 8) good.push(p); });
-    }
-
-    PROXY_LIST = [...PROXY_STATIC, ...good];
-    if (proxyIndex >= PROXY_LIST.length) proxyIndex = -1;
-    addErrorLog('PROXY', `Tìm được ${good.length} proxy dùng được (thử ${batch.length}).`);
-  } catch (e) {
-    addErrorLog('PROXY', `Không tải được danh sách proxy: ${e.message}`);
-  } finally {
-    proxyRefreshing = false;
-  }
-}
-
-function rotateProxy() {
-  if (PROXY_LIST.length === 0 || !SocksClient) return false;
-  proxyIndex = proxyIndex + 1 >= PROXY_LIST.length ? -1 : proxyIndex + 1;
-  addErrorLog('ĐỔI IP', `Chuyển sang: ${getProxyLabel()}`);
-  return true;
-}
 let consecutiveFailures = 0; 
 
 // QUẢN LÝ TIMERS & INTERVALS
@@ -267,24 +147,6 @@ function safeChat(msg) {
 }
 
 app.get('/api/ping', (req, res) => res.send('PONG_OK'));
-
-// ĐỔI IP THỦ CÔNG TỪ DASHBOARD
-app.get('/api/rotate-proxy', (req, res) => {
-  if (rotateProxy()) {
-    consecutiveFailures = 0;
-    currentReconnectDelay = 12000;
-    if (!isManualStopped) createBot();
-  } else {
-    if (PROXY_LIST_URL) {
-      needRotate = true;
-      refreshProxyList();
-      addErrorLog('ĐỔI IP', 'Chưa có proxy nào, đang tìm proxy mới...');
-    } else {
-      addErrorLog('ĐỔI IP', 'Chưa cấu hình biến PROXIES hoặc PROXY_LIST_URL (hoặc thiếu gói socks) nên không thể đổi IP.');
-    }
-  }
-  res.redirect('/');
-});
 
 // ENDPOINT CẬP NHẬT CẤU HÌNH TỰ ĐỘNG (AN TOÀN KHI RECONNECT)
 app.post('/api/update-config', (req, res) => {
@@ -735,10 +597,6 @@ app.get('/', (req, res) => {
                 <span class="label">RAM</span>
                 <span class="value">${memoryUsage} MB</span>
               </div>
-              <div class="status-item">
-                <span class="label">Kết Nối Qua</span>
-                <span class="value">${getProxyLabel()}</span>
-              </div>
             </div>
 
             <form class="input-group" action="/api/command" method="POST">
@@ -753,7 +611,6 @@ app.get('/', (req, res) => {
               }
               <a href="/api/inventory" style="text-decoration: none;"><button type="button" class="btn-purple" style="width: 100%;">Túi Đồ [inv]</button></a>
               <a href="/api/tusat" style="text-decoration: none;"><button type="button" class="btn-stop" style="width: 100%;">Tự Sát (/tusat)</button></a>
-              ${(PROXY_LIST.length > 0 || PROXY_LIST_URL) ? `<a href="/api/rotate-proxy" style="text-decoration: none;"><button type="button" class="btn-purple" style="width: 100%;">Đổi IP (Proxy)</button></a>` : ''}
               <a href="/api/clear-error-log" style="text-decoration: none;"><button type="button" class="btn-warning" style="width: 100%;">Xóa Lỗi</button></a>
               <a href="/api/clear-mention-log" style="text-decoration: none;"><button type="button" class="btn-warning" style="width: 100%;">Mention (${botMentionLogs.length})</button></a>
               <a href="/api/hard-restart" style="text-decoration: none;" onclick="return confirm('Reset toàn bộ Tiến Trình Code?');"><button type="button" class="btn-stop" style="width: 100%;">Reset App</button></a>
@@ -837,7 +694,7 @@ app.get('/', (req, res) => {
                 </div>
                 <div>
                   <label>Mật Khẩu (Đã Ẩn Tối Đa):</label>
-                  <input type="password" name="password" value="" placeholder="Để trống = giữ mật khẩu hiện tại" autocomplete="off">
+                  <input type="password" name="password" value="${BOT_PASSWORD}" required autocomplete="off">
                 </div>
               </div>
               <div style="margin-top: 10px;">
@@ -1085,7 +942,6 @@ function createBot() {
   if (isManualStopped) return;
 
   cleanupBot();
-  isReconnecting = false; // tránh kẹt cờ khi bật/tắt thủ công lúc đang chờ reconnect
   isFirstSpawn = true;
   lastTimeAge = 0;
   lastTimeAgeUpdate = Date.now();
@@ -1101,41 +957,15 @@ function createBot() {
     viewDistance: 'tiny'
   };
 
-  // Đặt MC_VERSION (vd: 1.20.4) trên Render để khỏi dò phiên bản (nên đặt khi dùng proxy)
-  if (process.env.MC_VERSION) currentOptions.version = process.env.MC_VERSION;
+  console.log(`\n[HỆ THỐNG] Kết nối đến ${currentOptions.host}:${currentOptions.port} với tên [${BOT_USERNAME}]...`);
 
-  if (needRotate && PROXY_LIST.length > 0) {
-    needRotate = false;
-    rotateProxy();
-  }
-
-  const proxy = getCurrentProxy();
-  if (proxy) {
-    currentOptions.connect = (client) => {
-      SocksClient.createConnection({
-        proxy,
-        command: 'connect',
-        destination: { host: BOT_HOST, port: BOT_PORT },
-        timeout: 15000
-      }).then(({ socket }) => {
-        client.setSocket(socket);
-        client.emit('connect');
-      }).catch(err => client.emit('error', err));
-    };
-  }
-
-  console.log(`\n[HỆ THỐNG] Kết nối đến ${currentOptions.host}:${currentOptions.port} với tên [${BOT_USERNAME}] - ${getProxyLabel()}...`);
-
-  let thisBot = null; // để bỏ qua sự kiện của bot cũ
   try {
     bot = mineflayer.createBot(currentOptions);
-    thisBot = bot;
     bot.setMaxListeners(0);
 
     if (bot._client) {
       bot._client.setMaxListeners(0);
       bot._client.on('error', (err) => {
-        if (bot !== thisBot) return;
         addErrorLog('Client Socket Error', err.message || err.code || 'Lỗi TCP Socket');
       });
     }
@@ -1146,15 +976,11 @@ function createBot() {
   }
 
   bot.on('spawn', () => {
-    if (bot !== thisBot) return;
     console.log('[LOG] Bot đã vào game!');
     addChatLog('Kết nối ổn định thành công!');
     triggerChatWindow(12000);
 
-    // Chỉ coi là ổn định khi ở lại server >= 60s (tránh vòng lặp vào/ra reset bộ đếm)
-    setTimeout(() => {
-      if (bot === thisBot) { consecutiveFailures = 0; currentReconnectDelay = 12000; sameIpKicks = 0; }
-    }, 60000);
+    consecutiveFailures = 0;
 
     if (isFirstSpawn) {
       isFirstSpawn = false;
@@ -1175,6 +1001,15 @@ function createBot() {
       }, 7000);
 
       ramGcInterval = setInterval(() => {
+        if (bot && bot.entities) {
+          const myPos = bot.entity ? bot.entity.position : null;
+          Object.keys(bot.entities).forEach(id => {
+            const ent = bot.entities[id];
+            if (!ent || !myPos || (ent.position && ent.position.distanceTo(myPos) > 12) || ent.id !== bot.entity?.id) {
+              delete bot.entities[id];
+            }
+          });
+        }
         if (global.gc) {
           try { global.gc(); } catch (e) {}
         }
@@ -1203,8 +1038,8 @@ function createBot() {
 
         if (bot.time) {
           if (bot.time.age === lastTimeAge) {
-            if (Date.now() - lastTimeAgeUpdate > 120000) {
-              addErrorLog('Watchdog', 'Kẹt Packet thế giới > 120s. Tiến hành Reconnect...');
+            if (Date.now() - lastTimeAgeUpdate > 45000) {
+              addErrorLog('Watchdog', 'Kẹt Packet thế giới > 45s. Tiến hành Reconnect...');
               handleReconnect();
             }
           } else {
@@ -1217,7 +1052,6 @@ function createBot() {
   });
 
   bot.on('death', () => {
-    if (bot !== thisBot) return;
     addChatLog('Bot tử vong! Chờ hồi sinh...');
     addErrorLog('Event Chết', 'Bot tử vong');
 
@@ -1237,7 +1071,6 @@ function createBot() {
   });
 
   bot.on('message', (message) => {
-    if (bot !== thisBot) return;
     try {
       const text = message.toString().trim();
       if (!text) return;
@@ -1265,62 +1098,26 @@ function createBot() {
   });
 
   bot.on('end', (reason) => {
-    if (bot !== thisBot) return; // bot cũ đã bị thay thế -> bỏ qua
     stopFeatureLoops();
     addErrorLog('Mất Kết Nối (End)', `Server ngắt socket: ${reason}`);
     handleReconnect();
   });
 
   bot.on('error', (err) => {
-    if (bot !== thisBot) return;
     stopFeatureLoops();
     addErrorLog('Mineflayer Error', err.message || err.toString());
-
-    // Lỗi khi chưa vào được server (proxy chết, bị reset...) -> đổi IP (nếu có) và kết nối lại
-    if (!bot._client || bot._client.state !== 'play') {
-      if (getCurrentProxy()) rotateProxy();
-      handleReconnect();
-    }
   });
 
   bot.on('kicked', (reason) => {
-    if (bot !== thisBot) return;
     stopFeatureLoops();
     const reasonStr = typeof reason === 'string' ? reason : JSON.stringify(reason);
     addErrorLog('Bị Server Kick', reasonStr);
-
-    if (/ᴄùɴɢ\s*ɪᴘ|cùng\s*ip|cung\s*ip/i.test(reasonStr)) {
-      // Server báo trùng IP -> đổi ngay sang IP khác (gần như không chờ)
-      sameIpKicks++;
-      consecutiveFailures = 0; // không để app tự restart (mất cài đặt) chỉ vì trùng IP
-      const changed = rotateProxy();
-      if (changed) {
-        currentReconnectDelay = Math.min(5000 * sameIpKicks, 60000);
-        addErrorLog('TRÙNG IP', `Server báo trùng IP -> đổi sang: ${getProxyLabel()}`);
-      } else if (PROXY_LIST_URL) {
-        needRotate = true;
-        refreshProxyList();
-        currentReconnectDelay = 30000;
-        addErrorLog('TRÙNG IP', 'Server báo trùng IP. Đang tự tìm proxy mới...');
-      } else {
-        currentReconnectDelay = 60000;
-        addErrorLog('TRÙNG IP', 'Server báo trùng IP. Chưa có PROXIES nên chờ 60s rồi thử lại.');
-      }
-    } else if (reasonStr.includes('LƯU DỮ LIỆU') || reasonStr.includes('lưu dữ liệu') || reasonStr.includes('\u003d\u003d')) {
+    
+    if (reasonStr.includes('LƯU DỮ LIỆU') || reasonStr.includes('lưu dữ liệu') || reasonStr.includes('\u003d\u003d')) {
       currentReconnectDelay = 25000;
     }
     handleReconnect();
   });
-
-  // Quá 45s mà chưa vào được game (proxy treo, server không trả lời...) -> thử lại
-  setTimeout(() => {
-    if (!thisBot || bot !== thisBot || isManualStopped) return;
-    if (!bot._client || bot._client.state !== 'play') {
-      addErrorLog('Timeout', 'Quá 45s chưa vào được server. Thử kết nối lại...');
-      if (getCurrentProxy()) rotateProxy();
-      handleReconnect();
-    }
-  }, 45000);
 }
 
 function handleReconnect() {
@@ -1340,19 +1137,15 @@ function handleReconnect() {
 
   console.log(`Chờ ${currentReconnectDelay / 1000}s để tái kết nối...`);
   
-  const delay = currentReconnectDelay;
   reconnectTimeout = setTimeout(() => {
     isReconnecting = false;
+    currentReconnectDelay = 12000;
     createBot();
-  }, delay);
-  // Tăng dần thời gian chờ (tối đa 2 phút) để không dồn dập vào server
-  currentReconnectDelay = Math.min(Math.round(currentReconnectDelay * 1.5), 120000);
+  }, currentReconnectDelay);
 }
 
 // KHỞI CHẠY BOT BAN ĐẦU
 createBot();
-refreshProxyList();
-setInterval(refreshProxyList, 30 * 60 * 1000);
 
 process.on('uncaughtException', (err) => {
   addErrorLog('Uncaught Exception', `${err.message} (${err.code || 'NO_CODE'})`);
